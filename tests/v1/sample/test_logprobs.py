@@ -1662,6 +1662,49 @@ def test_chunked_prompt_logprobs_match_unchunked(
     torch.testing.assert_close(ranks, expected.selected_token_ranks)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_logprobs", [0, 1, 8])
+@pytest.mark.parametrize("vocab_size", [1000, 4097, 151936])
+def test_fused_topk_scores(vocab_size: int, num_logprobs: int, dtype: torch.dtype):
+    """The one-pass kernels must match log_softmax, topk and a rank count, and
+    each row's result must not depend on the rest of the batch."""
+    if not current_platform.is_cuda_alike():
+        pytest.skip("the logprob kernels are Triton")
+    from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+
+    device = torch.device(current_platform.device_type)
+    num_tokens = 37
+    logits = torch.randn(num_tokens, vocab_size, device=device).to(dtype)
+    logits[1, ::2] = float("-inf")  # e.g. top-k/top-p masked processed logits
+    logits[2, vocab_size // 2] = float("nan")
+    sampled = torch.randint(vocab_size, (num_tokens,), device=device)
+    sampled[1] = 1
+
+    result = compute_topk_scores(logits, num_logprobs, sampled)
+    ids, logprobs = result.logprob_token_ids, result.logprobs
+    assert ids.shape == logprobs.shape == (num_tokens, num_logprobs + 1)
+    assert torch.equal(ids[:, 0], sampled)
+    assert logprobs[2].isnan().all()
+
+    finite = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    finite[2] = False
+    ref = torch.log_softmax(logits[finite].float(), dim=-1)
+    torch.testing.assert_close(logprobs[finite], ref.gather(-1, ids[finite]))
+    torch.testing.assert_close(logprobs[finite, 1:], ref.topk(num_logprobs).values)
+    assert (ids[finite, 1:].sort(dim=-1).values.diff(dim=-1) != 0).all()
+    sampled_logits = logits.gather(-1, sampled.unsqueeze(-1))
+    expected_ranks = (logits >= sampled_logits).sum(dim=-1)
+    assert torch.equal(result.selected_token_ranks[finite], expected_ranks[finite])
+
+    for i in (0, 1, num_tokens - 1):
+        row = compute_topk_scores(logits[i : i + 1], num_logprobs, sampled[i : i + 1])
+        assert torch.equal(row.logprob_token_ids, ids[i : i + 1])
+        assert torch.equal(row.logprobs, logprobs[i : i + 1])
+        assert torch.equal(
+            row.selected_token_ranks, result.selected_token_ranks[i : i + 1]
+        )
+
+
 def test_trace_replay_with_spec_decode():
     prompt = "Hello world " * 50
     llm_kwargs = dict(

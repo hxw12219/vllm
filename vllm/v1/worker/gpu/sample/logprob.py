@@ -109,6 +109,183 @@ def compute_token_logprobs(
     return logprobs
 
 
+# Vocab slice per program in the fused path. A row's split depends only on the
+# vocab size, so its results do not depend on the rest of the batch.
+_FUSED_BLOCK_SIZE = 4096
+# Each top-k entry costs one max/argmin pass over the slice. Up to k=8 the
+# fused path beat torch.topk at every batch size up to 4096 rows on B300; at
+# k=20 it fell behind from about 512 rows, so larger k uses torch.topk.
+_FUSED_MAX_TOPK = 8
+
+
+@triton.jit
+def _fused_topk_partial_kernel(
+    logits_ptr,
+    logits_stride,
+    sampled_ptr,
+    max_ptr,
+    sum_ptr,
+    count_ptr,
+    top_val_ptr,
+    top_idx_ptr,
+    vocab_size,
+    num_blocks,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    offs = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offs < vocab_size
+    row_ptr = logits_ptr + row * logits_stride
+    x = tl.load(row_ptr + offs, mask=valid, other=float("-inf")).to(tl.float32)
+    sampled = tl.load(row_ptr + tl.load(sampled_ptr + row)).to(tl.float32)
+
+    out = row * num_blocks + block
+    block_max = tl.max(x, axis=0)
+    # Zero only -inf entries, so a NaN logit still poisons the row's sum.
+    e = tl.where(x == float("-inf"), 0.0, tl.exp(x - block_max))
+    tl.store(max_ptr + out, block_max)
+    tl.store(sum_ptr + out, tl.sum(e, axis=0))
+    tl.store(count_ptr + out, tl.sum((valid & (x >= sampled)).to(tl.int32), axis=0))
+
+    # Top-k of this slice, ties broken by the lowest token id.
+    ids = tl.where(valid, offs, vocab_size)
+    for k in tl.static_range(TOPK):
+        best = tl.max(x, axis=0)
+        idx = tl.min(tl.where(x == best, ids, vocab_size), axis=0)
+        tl.store(top_val_ptr + out * TOPK + k, best)
+        tl.store(top_idx_ptr + out * TOPK + k, idx)
+        taken = ids == idx
+        x = tl.where(taken, float("-inf"), x)
+        ids = tl.where(taken, vocab_size, ids)
+
+
+@triton.jit
+def _fused_topk_merge_kernel(
+    logits_ptr,
+    logits_stride,
+    sampled_ptr,
+    max_ptr,
+    sum_ptr,
+    count_ptr,
+    top_val_ptr,
+    top_idx_ptr,
+    out_ids_ptr,
+    out_logprobs_ptr,
+    out_ranks_ptr,
+    vocab_size,
+    num_blocks,
+    TOPK: tl.constexpr,
+    BLOCKS_P2: tl.constexpr,
+    CANDIDATES_P2: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    blocks = tl.arange(0, BLOCKS_P2)
+    in_row = blocks < num_blocks
+    base = row * num_blocks
+    block_max = tl.load(max_ptr + base + blocks, mask=in_row, other=float("-inf"))
+    block_sum = tl.load(sum_ptr + base + blocks, mask=in_row, other=0.0)
+    row_max = tl.max(block_max, axis=0)
+    scaled = tl.where(
+        block_max == float("-inf"), 0.0, block_sum * tl.exp(block_max - row_max)
+    )
+    lse = tl.log(tl.sum(scaled, axis=0))
+    rank = tl.sum(tl.load(count_ptr + base + blocks, mask=in_row, other=0), axis=0)
+    tl.store(out_ranks_ptr + row, rank.to(tl.int64))
+
+    token = tl.load(sampled_ptr + row)
+    logit = tl.load(logits_ptr + row * logits_stride + token).to(tl.float32)
+    out = row * (TOPK + 1)
+    tl.store(out_ids_ptr + out, token.to(tl.int64))
+    tl.store(out_logprobs_ptr + out, logit - row_max - lse)
+    if TOPK > 0:
+        cands = tl.arange(0, CANDIDATES_P2)
+        in_cands = cands < num_blocks * TOPK
+        vals = tl.load(
+            top_val_ptr + base * TOPK + cands, mask=in_cands, other=float("-inf")
+        )
+        ids = tl.load(
+            top_idx_ptr + base * TOPK + cands, mask=in_cands, other=vocab_size
+        )
+        for k in tl.static_range(TOPK):
+            best = tl.max(vals, axis=0)
+            idx = tl.min(tl.where(vals == best, ids, vocab_size), axis=0)
+            tl.store(out_ids_ptr + out + 1 + k, idx.to(tl.int64))
+            tl.store(out_logprobs_ptr + out + 1 + k, best - row_max - lse)
+            taken = ids == idx
+            vals = tl.where(taken, float("-inf"), vals)
+            ids = tl.where(taken, vocab_size, ids)
+
+
+def _fused_topk_scores(
+    logits: torch.Tensor, num_logprobs: int, sampled_token_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Token ids, logprobs and sampled-token ranks from one read of the logits.
+
+    Each program reduces one vocab slice of a row to its max, exp-sum, count of
+    logits at or above the sampled token's, and top-k; a second kernel merges
+    a row's slices. Column 0 is the sampled token, then the top-k in
+    descending order.
+    """
+    num_tokens, vocab_size = logits.shape
+    device = logits.device
+    sampled_token_ids = sampled_token_ids.contiguous()
+    num_blocks = triton.cdiv(vocab_size, _FUSED_BLOCK_SIZE)
+    k = max(num_logprobs, 1)
+    block_max = torch.empty(num_tokens, num_blocks, dtype=torch.float32, device=device)
+    block_sum = torch.empty_like(block_max)
+    block_count = torch.empty(num_tokens, num_blocks, dtype=torch.int32, device=device)
+    top_val = torch.empty(num_tokens, num_blocks, k, dtype=torch.float32, device=device)
+    top_idx = torch.empty(num_tokens, num_blocks, k, dtype=torch.int32, device=device)
+    token_ids = torch.empty(
+        num_tokens, num_logprobs + 1, dtype=torch.int64, device=device
+    )
+    logprobs = torch.empty(
+        num_tokens, num_logprobs + 1, dtype=torch.float32, device=device
+    )
+    ranks = torch.empty(num_tokens, dtype=torch.int64, device=device)
+    if num_tokens > 0:
+        _fused_topk_partial_kernel[(num_tokens, num_blocks)](
+            logits,
+            logits.stride(0),
+            sampled_token_ids,
+            block_max,
+            block_sum,
+            block_count,
+            top_val,
+            top_idx,
+            vocab_size,
+            num_blocks,
+            TOPK=num_logprobs,
+            BLOCK_SIZE=_FUSED_BLOCK_SIZE,
+            num_warps=8,
+        )
+        _fused_topk_merge_kernel[(num_tokens,)](
+            logits,
+            logits.stride(0),
+            sampled_token_ids,
+            block_max,
+            block_sum,
+            block_count,
+            top_val,
+            top_idx,
+            token_ids,
+            logprobs,
+            ranks,
+            vocab_size,
+            num_blocks,
+            TOPK=num_logprobs,
+            BLOCKS_P2=triton.next_power_of_2(num_blocks),
+            CANDIDATES_P2=triton.next_power_of_2(num_blocks * k),
+            num_warps=4,
+        )
+    if num_logprobs == 0:
+        # Match the unfused path, which returns the sampled ids themselves.
+        token_ids = sampled_token_ids.unsqueeze(-1)
+    return token_ids, logprobs, ranks
+
+
 def compute_topk_scores(
     logits: torch.Tensor,
     num_logprobs: int,
@@ -121,6 +298,23 @@ def compute_topk_scores(
 ) -> LogprobsTensors:
     assert num_logprobs >= 0
     batch_size, vocab_size = logits.shape
+    is_tensor = isinstance(cu_num_logits, torch.Tensor)
+
+    if (
+        max_per_req_token_ids == 0
+        and not logits_mode
+        and num_logprobs <= _FUSED_MAX_TOPK
+    ):
+        logprob_token_ids, scores, token_ranks = _fused_topk_scores(
+            logits, num_logprobs, sampled_token_ids
+        )
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=scores,
+            selected_token_ranks=token_ranks,
+            cu_num_generated_tokens=None if is_tensor else cu_num_logits,
+            cu_num_generated_tokens_tensor=cu_num_logits if is_tensor else None,
+        )
 
     if max_per_req_token_ids == 0:
         # Fast path: no request asked for custom logprob_token_ids.
@@ -180,7 +374,6 @@ def compute_topk_scores(
         vocab_size,
         BLOCK_SIZE=8192,  # type: ignore
     )
-    is_tensor = isinstance(cu_num_logits, torch.Tensor)
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
         logprobs=scores,
