@@ -373,6 +373,7 @@ def make_request(
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
     num_hash_lookahead_tokens: int = 0,
+    prompt_is_token_ids: list[bool] | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -401,6 +402,7 @@ def make_request(
             block_size, hash_fn, num_hash_lookahead_tokens
         ),
         prompt_embeds=prompt_embeds,
+        prompt_is_token_ids=prompt_is_token_ids,
     )
 
 
@@ -1032,6 +1034,60 @@ def test_generate_block_hash_extra_keys_different_prompt_embeds():
     extra_keys1, _ = generate_block_hash_extra_keys(request1, 0, 5, 0)
     extra_keys2, _ = generate_block_hash_extra_keys(request2, 0, 5, 0)
     assert extra_keys1 != extra_keys2
+
+
+def _mixed_request(prompt_embeds: torch.Tensor, is_token_ids: list[bool]):
+    token_ids = [7] * len(is_token_ids)
+    return make_request(
+        request_id="mixed",
+        prompt_token_ids=token_ids,
+        prompt_embeds=prompt_embeds,
+        prompt_is_token_ids=is_token_ids,
+    )
+
+
+def test_generate_block_hash_extra_keys_mixed_prompt_embeds_reads_only_embeds_rows():
+    is_token_ids = [True, False, True, True, False]
+    prompt_embeds = torch.randn(5, 3)
+    extra_keys, _ = generate_block_hash_extra_keys(
+        _mixed_request(prompt_embeds, is_token_ids), 0, 5, 0
+    )
+    assert extra_keys is not None
+
+    # Rows at token positions are never read, so they do not change the key.
+    unread_changed = prompt_embeds.clone()
+    unread_changed[[0, 2, 3]] = torch.randn(3, 3)
+    assert generate_block_hash_extra_keys(
+        _mixed_request(unread_changed, is_token_ids), 0, 5, 0
+    ) == (extra_keys, 0)
+
+    read_changed = prompt_embeds.clone()
+    read_changed[4] = torch.randn(3)
+    assert generate_block_hash_extra_keys(
+        _mixed_request(read_changed, is_token_ids), 0, 5, 0
+    ) != (extra_keys, 0)
+
+
+def test_generate_block_hash_extra_keys_mixed_prompt_embeds_includes_mask():
+    prompt_embeds = torch.zeros(5, 3)
+    keys1, _ = generate_block_hash_extra_keys(
+        _mixed_request(prompt_embeds, [True, False, True, True, True]), 0, 5, 0
+    )
+    keys2, _ = generate_block_hash_extra_keys(
+        _mixed_request(prompt_embeds, [True, True, False, True, True]), 0, 5, 0
+    )
+    assert keys1 != keys2
+
+
+def test_generate_block_hash_extra_keys_mixed_prompt_embeds_token_only_block():
+    request = _mixed_request(torch.randn(10, 3), [True] * 5 + [False] * 5)
+    plain = make_request(request_id="plain", prompt_token_ids=[7] * 10)
+
+    # A block of only token IDs gets the key of the same tokens without embeds.
+    assert generate_block_hash_extra_keys(request, 0, 5, 0) == (
+        generate_block_hash_extra_keys(plain, 0, 5, 0)
+    )
+    assert generate_block_hash_extra_keys(request, 5, 10, 0)[0] is not None
 
 
 def test_generate_block_hash_extra_keys_lora():

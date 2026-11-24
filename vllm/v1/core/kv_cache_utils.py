@@ -608,8 +608,8 @@ def _gen_prompt_embeds_extra_hash_keys(
         end_token_idx: The end token index of the block.
 
     Returns:
-        Return a stable hash of the block prompt embeddings if prompt embeds
-        are present. Return empty list otherwise.
+        Return a stable hash of the prompt embeddings the block reads, if
+        any. Return empty list otherwise.
 
     """
     if request.prompt_embeds is None:
@@ -617,11 +617,42 @@ def _gen_prompt_embeds_extra_hash_keys(
     block_range = (start_token_idx, end_token_idx)
     embeds_hash = request._prompt_embeds_per_block_hashes.get(block_range)
     if embeds_hash is None:
-        block_prompt_embeds = request.prompt_embeds[start_token_idx:end_token_idx]
         # Hash prompt embeds once per block and cache on request
-        embeds_hash = hashlib.sha256(tensor_data(block_prompt_embeds)).digest()
+        embeds_hash = _hash_block_prompt_embeds(request, start_token_idx, end_token_idx)
         request._prompt_embeds_per_block_hashes[block_range] = embeds_hash
+    if not embeds_hash:
+        return []
     return [("prompt_embeds", embeds_hash)]
+
+
+def _hash_block_prompt_embeds(
+    request: Request, start_token_idx: int, end_token_idx: int
+) -> bytes:
+    """Hash the prompt embeds rows the model reads in a block.
+
+    In a mixed prompt, the model reads `prompt_embeds` only where
+    `prompt_is_token_ids` is False, and the token ID there is zeroed. The hash
+    covers those rows and their offsets in the block, so it also captures the
+    block's mask. A block without such rows returns b"" and gets no embeds key,
+    like the same tokens sent without embeds.
+    """
+    assert request.prompt_embeds is not None
+    is_token_ids = request.prompt_is_token_ids
+    if is_token_ids is None:
+        block_prompt_embeds = request.prompt_embeds[start_token_idx:end_token_idx]
+        return hashlib.sha256(tensor_data(block_prompt_embeds)).digest()
+    rows = [
+        i
+        for i in range(start_token_idx, min(end_token_idx, len(is_token_ids)))
+        if not is_token_ids[i]
+    ]
+    if not rows:
+        return b""
+    hasher = hashlib.sha256(len(rows).to_bytes(4, "little"))
+    for i in rows:
+        hasher.update((i - start_token_idx).to_bytes(4, "little"))
+    hasher.update(tensor_data(request.prompt_embeds[rows]))
+    return hasher.digest()
 
 
 def generate_block_hash_extra_keys(
